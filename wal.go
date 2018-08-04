@@ -2,6 +2,9 @@ package raftwal
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 
@@ -10,10 +13,13 @@ import (
 )
 
 const (
-	headerSize = 4096
+	metaPageSize = 4096
 )
 
+var ErrKeyNotFound = errors.New("key not found")
+
 type WAL struct {
+	meta       map[string][]byte
 	path       string
 	f          *os.File
 	index      []uint32
@@ -33,10 +39,23 @@ func New(dir string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
+	m := make(map[string][]byte)
+	metaBytes := make([]byte, metaPageSize)
+	_, err = f.ReadAt(metaBytes, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if metaBytes[0] == '{' {
+		json.Unmarshal(metaBytes, m)
+	}
+
 	return &WAL{
-		path:  path,
-		f:     f,
-		index: make([]uint32, 0, 128*1024),
+		meta:       m,
+		path:       path,
+		f:          f,
+		index:      make([]uint32, 0, 128*1024),
+		nextOffset: metaPageSize,
 	}, nil
 }
 
@@ -177,8 +196,8 @@ func (w *WAL) StoreLogs(logs []*raft.Log) error {
 	if err != nil {
 		return err
 	}
-	//err = fileutil.Fdatasync(w.f)
-	err = w.f.Sync()
+	err = fileutil.Fdatasync(w.f)
+	//err = w.f.Sync()
 	if err != nil {
 		return err
 	}
@@ -192,4 +211,53 @@ func (w *WAL) DeleteRange(min, max uint64) error {
 	w.mu.Unlock()
 	w.minIndex = max + 1
 	return nil
+}
+
+func (w *WAL) writeMeta() error {
+	bytes, err := json.Marshal(w.meta)
+	if err != nil {
+		return err
+	}
+	if len(bytes) > metaPageSize {
+		return fmt.Errorf("too big to write")
+	}
+	_, err = w.f.WriteAt(bytes, 0)
+	fileutil.Fdatasync(w.f)
+	return err
+}
+
+func (w *WAL) Set(key []byte, val []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.meta[string(key)] = val
+	return w.writeMeta()
+}
+
+// Get returns the value for key, or an empty byte slice if key was not found.
+func (w *WAL) Get(key []byte) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	v, ok := w.meta[string(key)]
+	if ok {
+		return v, nil
+	}
+	return nil, ErrKeyNotFound
+}
+
+func (w *WAL) SetUint64(key []byte, val uint64) error {
+	var bs [8]byte
+	binary.BigEndian.PutUint64(bs[:], val)
+	return w.Set(key, bs[:])
+}
+
+// GetUint64 returns the uint64 value for key, or 0 if key was not found.
+func (w *WAL) GetUint64(key []byte) (uint64, error) {
+	v, err := w.Get(key)
+	if err != nil {
+		return 0, err
+	}
+	if len(v) != 8 {
+		return 0, nil
+	}
+	return binary.BigEndian.Uint64(v), nil
 }

@@ -1,6 +1,7 @@
 package raftwal
 
 import (
+	"bytes"
 	"io/ioutil"
 	"os"
 	"reflect"
@@ -222,7 +223,7 @@ func TestWAL_DeleteRange(t *testing.T) {
 	}
 }
 
-/*func TestWAL_Set_Get(t *testing.T) {
+func TestWAL_Set_Get(t *testing.T) {
 	w := testWAL(t)
 	defer w.Close()
 	defer os.RemoveAll(w.path)
@@ -275,4 +276,3 @@ func TestWAL_SetUint64_GetUint64(t *testing.T) {
 		t.Fatalf("bad: %v", val)
 	}
 }
-*/
