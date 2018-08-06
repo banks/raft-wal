@@ -1,6 +1,7 @@
 package raftwal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,13 +11,14 @@ import (
 
 	"github.com/coreos/etcd/pkg/fileutil"
 	"github.com/hashicorp/raft"
+	"github.com/y0ssar1an/q"
 )
 
 const (
 	metaPageSize = 4096
 )
 
-var ErrKeyNotFound = errors.New("key not found")
+var ErrKeyNotFound = errors.New("not found")
 
 type WAL struct {
 	meta       map[string][]byte
@@ -26,6 +28,7 @@ type WAL struct {
 	minIndex   uint64
 	nextOffset int64
 	mu         sync.Mutex
+	pool       sync.Pool
 }
 
 func New(dir string) (*WAL, error) {
@@ -56,6 +59,11 @@ func New(dir string) (*WAL, error) {
 		f:          f,
 		index:      make([]uint32, 0, 128*1024),
 		nextOffset: metaPageSize,
+		pool: sync.Pool{
+			New: func() interface{} {
+				return bytes.NewBuffer(make([]byte, 0, 1024))
+			},
+		},
 	}, nil
 }
 
@@ -114,6 +122,10 @@ func (w *WAL) readAt(offset uint32, log *raft.Log) error {
 
 	len := binary.BigEndian.Uint32(prefix[:])
 
+	if len < 17 {
+		return errors.New("corrupt")
+	}
+
 	buf := make([]byte, len)
 	_, err = w.f.ReadAt(buf, of64+4)
 	if err != nil {
@@ -139,7 +151,8 @@ func (w *WAL) StoreLogs(logs []*raft.Log) error {
 		length += 4 + 8 + 8 + 1 + len(l.Data)
 	}
 
-	buf := make([]byte, length)
+	buf := w.pool.Get().(*bytes.Buffer)
+	defer w.pool.Put(buf)
 	offset := int64(0)
 
 	w.mu.Lock()
@@ -180,19 +193,50 @@ func (w *WAL) StoreLogs(logs []*raft.Log) error {
 		// 	return fmt.Errorf("didn't write all the bytes")
 		// }
 
+		err := binary.Write(buf, binary.BigEndian, uint32(8+8+1+len(l.Data)))
+		if err != nil {
+			return err
+		}
+		err = binary.Write(buf, binary.BigEndian, l.Index)
+		if err != nil {
+			return err
+		}
+		err = binary.Write(buf, binary.BigEndian, l.Term)
+		if err != nil {
+			return err
+		}
+		err = binary.Write(buf, binary.BigEndian, l.Type)
+		if err != nil {
+			return err
+		}
+		n, err := buf.Write(l.Data)
+		if err != nil {
+			return err
+		}
+		if n != len(l.Data) {
+			return fmt.Errorf("didn't write all the bytes")
+		}
+
 		// Encode length prefix
-		binary.BigEndian.PutUint32(buf[offset:offset+4],
-			uint32(8+8+1+len(l.Data)))
-		// Encode index
-		binary.BigEndian.PutUint64(buf[offset+4:offset+12], l.Index)
-		// Encode length prefix
-		binary.BigEndian.PutUint64(buf[offset+12:offset+20], l.Term)
-		buf[offset+20] = uint8(l.Type)
-		copy(buf[offset+21:], l.Data)
+		// binary.BigEndian.PutUint32(buf[offset:offset+4],
+		// 	uint32(8+8+1+len(l.Data)))
+		// // Encode index
+		// binary.BigEndian.PutUint64(buf[offset+4:offset+12], l.Index)
+		// // Encode length prefix
+		// binary.BigEndian.PutUint64(buf[offset+12:offset+20], l.Term)
+		// buf[offset+20] = uint8(l.Type)
+		// copy(buf[offset+21:], l.Data)
 		offset += 4 + 8 + 8 + 1 + int64(len(l.Data))
 	}
-
-	_, err := w.f.WriteAt(buf, w.nextOffset)
+	q.Q("Writing logs", length, len(logs))
+	// if len(logs) == 1 {
+	// 	typ := 1024
+	// 	if len(logs[0].Data) > 0 {
+	// 		typ = int(logs[0].Data[0] & 127)
+	// 	}
+	// 	q.Q("Log 1", logs[0].Type, typ)
+	// }
+	_, err := w.f.WriteAt(buf.Bytes(), w.nextOffset)
 	if err != nil {
 		return err
 	}
